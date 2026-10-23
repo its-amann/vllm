@@ -5,7 +5,11 @@ import json
 
 import pytest
 
-from tests.tool_parsers.utils import get_function_delta
+from tests.tool_parsers.utils import (
+    get_function_delta,
+    split_string_into_token_deltas,
+)
+from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
@@ -420,3 +424,211 @@ def test_hermes_streaming_content_and_tool_call_in_single_chunk(
     assert tool_parts[0].function.name == "f"
     args_str = "".join(tc.function.arguments or "" for tc in tool_parts)
     assert json.loads(args_str) == {"x": 1}
+
+
+# A completed call, then a `<tool_call>` region that cannot be a call.
+# The call is kept. The bad region and the text after it are content.
+# Text between valid calls, and text after the last valid call when no
+# bad region follows, stays omitted (`" Second. "`, and `" Third."` in
+# the two-call case).
+_WEATHER_CALL = (
+    '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>'
+)
+_PARIS = {"city": "Paris"}
+
+_TRAILING_CASES = [
+    (
+        "unclosed_tag",
+        f"First. {_WEATHER_CALL} Second. <tool_call>",
+        "First. <tool_call>",
+        [("get_weather", _PARIS)],
+    ),
+    (
+        "unclosed_prose",
+        f"First. {_WEATHER_CALL} Second. <tool_call> opens a call. Done.",
+        "First. <tool_call> opens a call. Done.",
+        [("get_weather", _PARIS)],
+    ),
+    (
+        "empty_closed_tag",
+        f"First. {_WEATHER_CALL} Second. <tool_call></tool_call> Third.",
+        "First. <tool_call></tool_call> Third.",
+        [("get_weather", _PARIS)],
+    ),
+    (
+        "non_json_closed_tag",
+        f"First. {_WEATHER_CALL} Second. <tool_call>not json</tool_call> Third.",
+        "First. <tool_call>not json</tool_call> Third.",
+        [("get_weather", _PARIS)],
+    ),
+    (
+        "trailing_text_only",
+        f"First. {_WEATHER_CALL} Second.",
+        "First. ",
+        [("get_weather", _PARIS)],
+    ),
+    (
+        "text_between_two_valid_calls",
+        f"First. {_WEATHER_CALL} Second. {_WEATHER_CALL} Third.",
+        "First. ",
+        [("get_weather", _PARIS), ("get_weather", _PARIS)],
+    ),
+    (
+        "unclosed_complete_json",
+        "First. "
+        + _WEATHER_CALL
+        + ' Second. <tool_call>\n{"name": "get_time", "arguments": {"tz": "UTC"}}',
+        "First. ",
+        [("get_weather", _PARIS), ("get_time", {"tz": "UTC"})],
+    ),
+]
+
+
+def _chunk_text(tokenizer: TokenizerLike, text: str, mode: str) -> list[str]:
+    if mode == "char":
+        return list(text)
+    if mode == "chunk5":
+        return [text[i : i + 5] for i in range(0, len(text), 5)]
+    assert mode == "token"
+    encoded = tokenizer.encode(text, add_special_tokens=False)
+    assert tokenizer.decode(encoded) == text
+    return split_string_into_token_deltas(tokenizer, text)
+
+
+def _record_delta(
+    message: DeltaMessage | None,
+    content_parts: list[str],
+    names: dict[int, str],
+    arguments: dict[int, str],
+) -> None:
+    if message is None:
+        return
+    if message.content:
+        content_parts.append(message.content)
+    for tool_call in message.tool_calls or []:
+        function = get_function_delta(tool_call)
+        if function.name:
+            names[tool_call.index] = function.name
+        if function.arguments:
+            arguments[tool_call.index] = (
+                arguments.get(tool_call.index, "") + function.arguments
+            )
+
+
+def _stream_hermes(
+    parser: Hermes2ProToolParser,
+    request: ChatCompletionRequest,
+    chunks: list[str],
+    *,
+    finish: bool,
+) -> tuple[str, list[tuple[str, dict]]]:
+    previous = ""
+    content_parts: list[str] = []
+    names: dict[int, str] = {}
+    arguments: dict[int, str] = {}
+    for delta in chunks:
+        current = previous + delta
+        message = parser.extract_tool_calls_streaming(
+            previous_text=previous,
+            current_text=current,
+            delta_text=delta,
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+            request=request,
+        )
+        previous = current
+        _record_delta(message, content_parts, names, arguments)
+    if finish:
+        _record_delta(parser.finish_streaming(), content_parts, names, arguments)
+    calls = [
+        (names[index], json.loads(arguments[index]))
+        for index in sorted(set(names) | set(arguments))
+    ]
+    return "".join(content_parts), calls
+
+
+@pytest.mark.parametrize(
+    ("case_id", "text", "expected_content", "expected_calls"),
+    _TRAILING_CASES,
+    ids=[case[0] for case in _TRAILING_CASES],
+)
+def test_hermes_nonstreaming_trailing_region(
+    qwen_tokenizer: TokenizerLike,
+    any_chat_request: ChatCompletionRequest,
+    case_id: str,
+    text: str,
+    expected_content: str,
+    expected_calls: list[tuple[str, dict]],
+) -> None:
+    """Non-streaming keeps valid calls and surfaces a bad trailing region."""
+    result = Hermes2ProToolParser(qwen_tokenizer).extract_tool_calls(
+        model_output=text,
+        request=any_chat_request,
+    )
+
+    assert result.tools_called, case_id
+    assert result.content == expected_content, case_id
+    assert len(result.tool_calls) == len(expected_calls)
+    for tool_call, (name, args) in zip(result.tool_calls, expected_calls):
+        assert tool_call.function.name == name
+        assert json.loads(tool_call.function.arguments) == args
+
+
+@pytest.mark.parametrize("mode", ["char", "chunk5", "token"])
+@pytest.mark.parametrize(
+    ("case_id", "text", "expected_content", "expected_calls"),
+    _TRAILING_CASES,
+    ids=[case[0] for case in _TRAILING_CASES],
+)
+def test_hermes_streaming_trailing_region_matches_nonstreaming(
+    qwen_tokenizer: TokenizerLike,
+    any_chat_request: ChatCompletionRequest,
+    mode: str,
+    case_id: str,
+    text: str,
+    expected_content: str,
+    expected_calls: list[tuple[str, dict]],
+) -> None:
+    """Streaming agrees with non-streaming, including at end of stream."""
+    parser = Hermes2ProToolParser(qwen_tokenizer)
+    content, calls = _stream_hermes(
+        parser,
+        any_chat_request,
+        _chunk_text(qwen_tokenizer, text, mode),
+        finish=True,
+    )
+
+    assert content == expected_content
+    assert calls == expected_calls
+
+    if case_id == "unclosed_tag":
+        held = Hermes2ProToolParser(qwen_tokenizer)
+        held_content, held_calls = _stream_hermes(
+            held,
+            any_chat_request,
+            _chunk_text(qwen_tokenizer, text, mode),
+            finish=False,
+        )
+        # The empty unclosed tag is still a possible call until the stream ends.
+        assert held_content == "First. "
+        assert held_calls == [("get_weather", _PARIS)]
+        flushed = held.finish_streaming()
+        assert flushed is not None
+        assert flushed.content == "<tool_call>"
+
+
+def test_hermes_nonstreaming_invalid_json_keeps_raw_text(
+    qwen_tokenizer: TokenizerLike,
+    any_chat_request: ChatCompletionRequest,
+) -> None:
+    """One incomplete call still falls back to the raw text."""
+    text = '<tool_call>\n{"name": "final_answer", "arguments": {"trigger": true}'
+    result = Hermes2ProToolParser(qwen_tokenizer).extract_tool_calls(
+        model_output=text,
+        request=any_chat_request,
+    )
+
+    assert not result.tools_called
+    assert result.tool_calls == []
+    assert result.content == text
