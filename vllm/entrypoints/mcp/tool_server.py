@@ -30,7 +30,11 @@ async def list_server_and_tools(server_url: str):
         list_tools_response = await session.list_tools()
         list_tool_result = list_tools_response
         seen_cursors = set()
+        max_pages = 1000
+        pages = 1
         while list_tools_response.next_cursor is not None:
+            if pages >= max_pages:
+                raise ValueError(f"MCP server tools/list exceeded {max_pages} pages")
             if list_tools_response.next_cursor in seen_cursors:
                 raise ValueError(
                     "MCP server returned a duplicate tools/list cursor "
@@ -41,7 +45,9 @@ async def list_server_and_tools(server_url: str):
                 params=PaginatedRequestParams(cursor=list_tools_response.next_cursor)
             )
             list_tool_result.tools.extend(list_tools_response.tools)
+            pages += 1
 
+        list_tool_result.next_cursor = None
         return initialize_response, list_tool_result
 
 

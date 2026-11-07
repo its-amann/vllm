@@ -21,6 +21,7 @@ from tests.utils import RemoteOpenAIServer
 from vllm.entrypoints.mcp.tool_server import (
     MCPToolServer,
     init_tool_server,
+    list_server_and_tools,
     post_process_tools_description,
 )
 
@@ -260,6 +261,80 @@ class TestMCPToolServerUnit:
                 assert exc_group.group_contains(
                     ValueError, match="duplicate tools/list"
                 )
+
+    @pytest.mark.asyncio
+    async def test_list_server_and_tools_clears_next_cursor_after_pagination(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        mcp_types = pytest.importorskip("mcp.types")
+
+        def make_tool(name: str) -> mcp_types.Tool:
+            return mcp_types.Tool(name=name, input_schema={"type": "object"})
+
+        first_page = mcp_types.ListToolsResult(
+            tools=[make_tool("first_page")], next_cursor="page2"
+        )
+        second_page = mcp_types.ListToolsResult(
+            tools=[make_tool("second_page")], next_cursor=None
+        )
+
+        session = MagicMock()
+        session.initialize = AsyncMock(return_value=MagicMock())
+        session.list_tools = AsyncMock(side_effect=[first_page, second_page])
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+
+        @asynccontextmanager
+        async def fake_sse_client(**_kwargs):
+            yield (MagicMock(), MagicMock())
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", fake_sse_client)
+        monkeypatch.setattr("mcp.ClientSession", lambda *_a, **_k: session)
+
+        _, merged = await list_server_and_tools("http://mcp.test")
+        assert merged.next_cursor is None
+        assert [tool.name for tool in merged.tools] == [
+            "first_page",
+            "second_page",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_list_server_and_tools_raises_when_page_cap_exceeded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        mcp_types = pytest.importorskip("mcp.types")
+        max_pages = 1000
+
+        def make_tool(index: int) -> mcp_types.Tool:
+            return mcp_types.Tool(
+                name=f"tool_{index}",
+                input_schema={"type": "object"},
+            )
+
+        def list_tools_side_effect(*_args, **kwargs):
+            params = kwargs.get("params")
+            page_index = 0 if params is None else int(params.cursor) + 1
+            next_cursor = None if page_index >= max_pages else str(page_index)
+            return mcp_types.ListToolsResult(
+                tools=[make_tool(page_index)],
+                next_cursor=next_cursor,
+            )
+
+        session = MagicMock()
+        session.initialize = AsyncMock(return_value=MagicMock())
+        session.list_tools = AsyncMock(side_effect=list_tools_side_effect)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+
+        @asynccontextmanager
+        async def fake_sse_client(**_kwargs):
+            yield (MagicMock(), MagicMock())
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", fake_sse_client)
+        monkeypatch.setattr("mcp.ClientSession", lambda *_a, **_k: session)
+
+        with pytest.raises(ValueError, match="exceeded 1000 pages"):
+            await list_server_and_tools("http://mcp.test")
 
 
 class TestMCPEnabled:
