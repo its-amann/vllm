@@ -347,6 +347,7 @@ class CompletionRequest(OpenAIBaseModel):
             length_penalty=self.length_penalty,
             include_stop_str_in_output=self.include_stop_str_in_output,
             skip_special_tokens=skip_special_tokens,
+            extra_args=dict(self.vllm_xargs) if self.vllm_xargs else None,
         )
 
     def extract_structured_outputs(self) -> StructuredOutputsParams | None:

@@ -72,3 +72,28 @@ def test_every_sampling_params_in_the_beam_path_forwards_extra_args(module_name)
         f"{missing}; a custom logits processor cannot see its per-request "
         "arguments on this path"
     )
+
+
+def test_openai_requests_forward_vllm_xargs_to_beam_search_params():
+    """`vllm_xargs` is how a REST client sets `extra_args`; beam requests must keep it."""
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+
+    xargs = {"target_token": 128}
+    chat = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        use_beam_search=True,
+        n=2,
+        vllm_xargs=xargs,
+    )
+    completion = CompletionRequest(
+        model="m", prompt="hi", use_beam_search=True, n=2, vllm_xargs=xargs
+    )
+    for request in (chat, completion):
+        params = request.to_beam_search_params(4, {})
+        assert params.extra_args == xargs
+        assert params.extra_args is not request.vllm_xargs
+
+    plain = CompletionRequest(model="m", prompt="hi", use_beam_search=True, n=2)
+    assert plain.to_beam_search_params(4, {}).extra_args is None
