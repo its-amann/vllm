@@ -288,6 +288,29 @@ def test_hermes_streaming_multiple_tool_calls_with_stream_interval(
     assert json.loads(args1) == {"q": "dogs"}
 
 
+@pytest.mark.parametrize("stream_interval", [1, 2, 4])
+def test_hermes_streaming_multiple_tool_calls_do_not_leak_into_content(
+    qwen_tokenizer: TokenizerLike,
+    any_chat_request: ChatCompletionRequest,
+    stream_interval: int,
+) -> None:
+    """Text after a finished call must stop at the next <tool_call>."""
+    text = (
+        '<tool_call>{"name": "search", "arguments": {"q": "cats"}}</tool_call>'
+        " and "
+        '<tool_call>{"name": "search", "arguments": {"q": "dogs"}}</tool_call>'
+    )
+    parser = Hermes2ProToolParser(qwen_tokenizer)
+    deltas = _simulate_streaming(
+        qwen_tokenizer, parser, any_chat_request, text, stream_interval
+    )
+
+    content = "".join(d.content for d in deltas if d.content)
+    assert content == " and "
+    tool_calls = [tc for d in deltas if d.tool_calls for tc in d.tool_calls]
+    assert [tc.index for tc in tool_calls if tc.function.name] == [0, 1]
+
+
 @pytest.mark.parametrize("stream_interval", [2, 5])
 def test_hermes_streaming_boolean_args_with_stream_interval(
     qwen_tokenizer: TokenizerLike,
@@ -392,8 +415,8 @@ def test_hermes_parser_non_streaming_preserves_content_between_calls(
     parser = Hermes2ProToolParser(default_tokenizer)
     start, end = parser.tool_call_start_token, parser.tool_call_end_token
     text = (
-        f"leading{start}{{\"name\": \"a\", \"arguments\": {{}}}}{end}"
-        f" mid {start}{{\"name\": \"b\", \"arguments\": {{}}}}{end}"
+        f'leading{start}{{"name": "a", "arguments": {{}}}}{end}'
+        f' mid {start}{{"name": "b", "arguments": {{}}}}{end}'
         " trailing"
     )
     result = parser.extract_tool_calls(model_output=text, request=any_chat_request)
