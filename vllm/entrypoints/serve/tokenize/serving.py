@@ -63,8 +63,6 @@ class ServingTokenization(BaseServing):
         if error_check_ret is not None:
             return error_check_ret
 
-        self.renderer.validate_token_ids(request.tokens, parameter="tokens")
-
         request_id = f"tokenize-{self._base_request_id(raw_request)}"
 
         lora_request = self._maybe_get_adapters(request)
@@ -144,6 +142,8 @@ class ServingTokenization(BaseServing):
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
+
+        self.renderer.validate_token_ids(request.tokens, parameter="tokens")
 
         request_id = f"tokenize-{self._base_request_id(raw_request)}"
 

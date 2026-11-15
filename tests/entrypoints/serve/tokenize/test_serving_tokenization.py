@@ -176,6 +176,8 @@ async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
         serving.online_renderer.preprocess_completion.call_args.kwargs["skip_mm_cache"]
         is True
     )
+    # Only /detokenize takes token ids from the client.
+    mock_engine.renderer.validate_token_ids.assert_not_called()
 
 
 @pytest.mark.asyncio
