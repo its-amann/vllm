@@ -87,8 +87,9 @@ class Granite4ToolParser(ToolParser):
                     arguments=dump_args(tc["arguments"]),
                 )
             )
-            # Append after parsing so a malformed call is not recorded.
-            self.prev_tool_call_arr.append(tc)
+        # Record only once every call in the batch parsed, otherwise a bad
+        # second call leaves the first one recorded but never streamed.
+        self.prev_tool_call_arr.extend(tool_calls_json)
         return "".join(text_segments), tool_calls
 
     def extract_tool_calls(
